@@ -3,6 +3,7 @@ all:
 include ../kaldi.mk
 
 BINFILES = lattice-char-index-position \
+           lattice-char-index-position-math \
            lattice-char-index-segment \
            lattice-word-index-position \
            lattice-word-index-segment \
