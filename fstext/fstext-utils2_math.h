@@ -34,6 +34,10 @@ void SegmentWFST(
                        std::set<typename Arc::StateId>>& segments,
     std::unordered_map<typename Arc::StateId,
                        std::set<typename Arc::StateId>>& segments_bin,
+    std::unordered_map<typename Arc::StateId,
+                       std::set<std::tuple<typename Arc::StateId,
+                                           typename Arc::Label,
+                                           typename Arc::StateId>>>& scope_closes,
     MutableFst<Arc>& fst,
     int32& final_state,
     std::set<typename Arc::StateId>& final_states,
@@ -83,7 +87,9 @@ void SegmentWFST(
           const auto previous = segmentation_points[std::get<0>(point)];
           segmentation_points[next_state].insert(previous.begin(),
                                                  previous.end());
-          segments[std::get<2>(point)].insert(next_state);
+          const auto scope_start = std::get<2>(point);
+          segments[scope_start].insert(next_state);
+          scope_closes[scope_start].emplace(state, label, next_state);
         }
       } else if (operator_segmentation_labels.count(label) != 0) {
         for (const auto& point : current_points) {

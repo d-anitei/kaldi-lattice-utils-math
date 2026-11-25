@@ -36,3 +36,4 @@
 .valgrind
 .depend.mk
 *.dSYM
+/util/analyze_math_index_timing.py

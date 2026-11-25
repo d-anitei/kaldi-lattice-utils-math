@@ -235,6 +235,7 @@ void ComputePrIxFST(
   std::vector< std::tuple<int32, int32> >& label_to_segm,
   const std::string& key,
   const double total_cost,
+  double max_neg_log_posterior,
   int32 pos,
   BaseFloat determinize_delta_,
   int32 num_nbest_
@@ -312,10 +313,16 @@ void ComputePrIxFST(
     }
     const auto t0 = nb_osyms.front() - 1;
     const auto t1 = nb_osyms.back() - 1;
-    auto prob = total_cost - nb_cost.Value();
-    nbest.emplace_back(pseudoword, pos, t0, t1, prob);
+    const double log_posterior = total_cost - nb_cost.Value();
+    if (max_neg_log_posterior != std::numeric_limits<double>::infinity() &&
+        !(log_posterior > -max_neg_log_posterior)) {
+      continue;
+    }
+    nbest.emplace_back(pseudoword, pos, t0, t1, log_posterior);
   }
 }
+
+using ScopeCloseArcs = std::set<std::tuple<int32, int32, int32>>;
 
 template <typename Arc, typename W>
 bool ExtractRegionFst(
@@ -324,6 +331,7 @@ bool ExtractRegionFst(
     const std::set<typename Arc::StateId>& end_states,
     const std::vector<W>& fw, const std::vector<W>& bw,
     int is_binary_type,
+    const ScopeCloseArcs* scope_closes,
     const std::set<typename Arc::StateId>& final_states,
     const std::unordered_set<typename Arc::Label>& operator_segmentation_labels,
     fst::VectorFst<Arc>* region_fst) {
@@ -374,7 +382,16 @@ bool ExtractRegionFst(
         weight = fst::Times(fw[n], weight);
       }
 
-      if (end_states.count(v) != 0) {
+      if (end_states.count(v) != 0 && scope_closes != nullptr &&
+          scope_closes->count(std::make_tuple(n, arc.ilabel, v)) != 0) {
+        // Consume the matching delimiter and its weight without emitting it.
+        region_fst->AddArc(output_src, Arc(0, arc.olabel,
+                                         fst::Times(weight, bw[v]),
+                                         output_final));
+        continue;
+      }
+
+      if (end_states.count(v) != 0 && scope_closes == nullptr) {
         const auto close_weight = fst::Times(weight, bw[v]);
         if (n == start_state) {
           if (operator_segmentation_labels.count(arc.ilabel) == 0) {
@@ -447,7 +464,8 @@ bool StartStatePosteriorMeetsThreshold(
     const std::vector<Weight>& bw,
     double total_cost,
     double max_neg_log_posterior) {
-  if (max_neg_log_posterior < 0.0) return true;
+  if (max_neg_log_posterior == std::numeric_limits<double>::infinity())
+    return true;
   const double state_cost =
       fw[start_state].Value() + bw[start_state].Value() - total_cost;
   return state_cost <= max_neg_log_posterior;
@@ -469,7 +487,7 @@ class LatticeScorerTask {
                     const GroupSet& operator_segmentation_labels,
                     const int32 num_nbest,
                     BaseFloat lattice_timeout,
-                    BaseFloat min_start_state_posterior,
+                    BaseFloat min_posterior,
                     BaseFloat determinize_delta,
                     BaseFloat acoustic_scale, BaseFloat graph_scale,
                     BaseFloat insertion_penalty, BaseFloat beam,
@@ -479,7 +497,7 @@ class LatticeScorerTask {
       operator_segmentation_labels_(operator_segmentation_labels),
       num_nbest_(num_nbest),
       lattice_timeout_(lattice_timeout),
-      min_start_state_posterior_(min_start_state_posterior),
+      min_posterior_(min_posterior),
       determinize_delta_(determinize_delta), acoustic_scale_(acoustic_scale),
       graph_scale_(graph_scale), insertion_penalty_(insertion_penalty),
       beam_(beam), score_writer_(score_writer) {}
@@ -542,13 +560,15 @@ class LatticeScorerTask {
 
     std::unordered_map<int32, std::set<int32>> segments;
     std::unordered_map<int32, std::set<int32>> segmentsBin;
+    std::unordered_map<int32, ScopeCloseArcs> scope_closes;
     int32 final_state;
     std::set<int32> final_states;
 
     // Collect delimiter scopes and operator split points from the lattice.
     {
       Timer stage_timer;
-      fst::SegmentWFST(segments, segmentsBin, tmp_fst, final_state,
+      fst::SegmentWFST(segments, segmentsBin, scope_closes, tmp_fst,
+                       final_state,
                        final_states, open_scope_labels_,
                        close_to_open_scope_label_,
                        operator_segmentation_labels_);
@@ -570,21 +590,24 @@ class LatticeScorerTask {
     std::unordered_map<int32, std::vector<std::vector<int32>>> visited_segments;
     std::unordered_map<int32, std::vector<std::vector<int32>>>
         visited_complete_segments;
-    const double max_neg_log_start_state_posterior =
-        min_start_state_posterior_ > 0.0
-            ? -std::log(min_start_state_posterior_)
-            : -1.0;
+    const double max_neg_log_posterior =
+        min_posterior_ > 0.0
+            ? -std::log(min_posterior_)
+            : std::numeric_limits<double>::infinity();
 
     // Single loop over delimiter scopes and operator split points.
     for (const auto beginState : sorted_scope_keys) {
       const auto& endStates = scope_segments.at(beginState);
       if (endStates.empty()) continue;
       if (!StartStatePosteriorMeetsThreshold(beginState, fw, bw, total_cost,
-                                             max_neg_log_start_state_posterior)) {
+                                             max_neg_log_posterior)) {
         continue;
       }
 
       const bool is_root_scope = beginState == tmp_fst.Start();
+      const auto closing_arcs = scope_closes.find(beginState);
+      const auto* scope_boundaries =
+          closing_arcs == scope_closes.end() ? nullptr : &closing_arcs->second;
       const bool emit_scope_segment =
           !is_root_scope || segments.count(beginState) != 0;
       auto& scope_visited =
@@ -597,7 +620,7 @@ class LatticeScorerTask {
         {
           Timer stage_timer;
           extracted = ExtractRegionFst(tmp_fst, beginState, endStates, fw, bw,
-                                       0, final_states,
+                                       0, scope_boundaries, final_states,
                                        operator_segmentation_labels_,
                                        &fst_subexp);
           extract_region_elapsed_ += stage_timer.Elapsed();
@@ -608,7 +631,8 @@ class LatticeScorerTask {
           {
             Timer stage_timer;
             ComputePrIxFST(nbest_segment_, fst_subexp, label_to_segm, key_,
-                           total_cost, pos, determinize_delta_, num_nbest_);
+                           total_cost, max_neg_log_posterior, pos,
+                           determinize_delta_, num_nbest_);
             compute_prix_elapsed_ += stage_timer.Elapsed();
             compute_prix_calls_++;
           }
@@ -635,7 +659,7 @@ class LatticeScorerTask {
           if (delim_left >= delim - 1) continue;
           if (!StartStatePosteriorMeetsThreshold(
                   delim_left, fw, bw, total_cost,
-                  max_neg_log_start_state_posterior)) {
+                  max_neg_log_posterior)) {
             continue;
           }
           const std::set<int32> left_end_states{delim};
@@ -649,7 +673,7 @@ class LatticeScorerTask {
           {
             Timer stage_timer;
             extracted = ExtractRegionFst(tmp_fst, delim_left, left_end_states,
-                                         fw, bw, 0, final_states,
+                                         fw, bw, 0, nullptr, final_states,
                                          operator_segmentation_labels_,
                                          &fst_subexp);
             extract_region_elapsed_ += stage_timer.Elapsed();
@@ -660,7 +684,8 @@ class LatticeScorerTask {
             {
               Timer stage_timer;
               ComputePrIxFST(nbest_segment_, fst_subexp, label_to_segm, key_,
-                             total_cost, pos, determinize_delta_, num_nbest_);
+                             total_cost, max_neg_log_posterior, pos,
+                             determinize_delta_, num_nbest_);
               compute_prix_elapsed_ += stage_timer.Elapsed();
               compute_prix_calls_++;
             }
@@ -670,7 +695,7 @@ class LatticeScorerTask {
         }
 
         if (!StartStatePosteriorMeetsThreshold(delim, fw, bw, total_cost,
-                                               max_neg_log_start_state_posterior)) {
+                                               max_neg_log_posterior)) {
           continue;
         }
 
@@ -691,7 +716,8 @@ class LatticeScorerTask {
         {
           Timer stage_timer;
           extracted = ExtractRegionFst(tmp_fst, delim, right_end_states, fw,
-                                       bw, is_complete, final_states,
+                                       bw, is_complete, scope_boundaries,
+                                       final_states,
                                        operator_segmentation_labels_,
                                        &fst_subexp);
           extract_region_elapsed_ += stage_timer.Elapsed();
@@ -702,7 +728,8 @@ class LatticeScorerTask {
           {
             Timer stage_timer;
             ComputePrIxFST(nbest_segment_, fst_subexp, label_to_segm, key_,
-                           total_cost, pos, determinize_delta_, num_nbest_);
+                           total_cost, max_neg_log_posterior, pos,
+                           determinize_delta_, num_nbest_);
             compute_prix_elapsed_ += stage_timer.Elapsed();
             compute_prix_calls_++;
           }
@@ -723,7 +750,8 @@ class LatticeScorerTask {
     {
       Timer stage_timer;
       ComputePrIxFST(nbest_segment_, tmp_fst, label_to_segm, key_,
-                     total_cost, pos, determinize_delta_, num_nbest_);
+                     total_cost, max_neg_log_posterior, pos,
+                     determinize_delta_, num_nbest_);
       compute_prix_elapsed_ += stage_timer.Elapsed();
       compute_prix_calls_++;
     }
@@ -754,7 +782,7 @@ class LatticeScorerTask {
   GroupSet operator_segmentation_labels_;
   const int32 num_nbest_;
   BaseFloat lattice_timeout_;
-  BaseFloat min_start_state_posterior_;
+  BaseFloat min_posterior_;
   BaseFloat determinize_delta_;
   BaseFloat acoustic_scale_, graph_scale_, insertion_penalty_, beam_;
   std::vector<output_tuple> nbest_segment_;
@@ -798,7 +826,7 @@ int main(int argc, char** argv) {
     BaseFloat beam = std::numeric_limits<BaseFloat>::infinity();
     BaseFloat determinize_delta = fst::kDelta / 8.0F;
     BaseFloat lattice_timeout = 300.0;
-    BaseFloat min_start_state_posterior = 1.0e-15;
+    BaseFloat min_posterior = 1.0e-15;
     int nbest = 100;
     std::string symbol_table_rxfilename = "";
     std::string open_delimiters_str = "{ {@";
@@ -820,9 +848,10 @@ int main(int argc, char** argv) {
     po.Register("lattice-timeout", &lattice_timeout,
                 "Discard lattices whose total processing time exceeds this "
                 "number of seconds. Use 0 or a negative value to disable.");
-    po.Register("min-start-state-posterior", &min_start_state_posterior,
-                "Skip any region whose start state has total posterior mass "
-                "below this threshold. Use 0 or a negative value to disable. "
+    po.Register("min-posterior", &min_posterior,
+                "Skip regions whose start-state posterior is below this "
+                "threshold and index entries whose posterior is at or below "
+                "it. Use 0 or a negative value to disable both filters. "
                 "Default is a conservative 1e-15.");
     po.Register("symbol-table", &symbol_table_rxfilename,
                 "Symbol table used to resolve math delimiter labels.");
@@ -881,7 +910,7 @@ int main(int argc, char** argv) {
                                                operator_segmentation_labels,
                                                nbest,
                                                lattice_timeout,
-                                               min_start_state_posterior,
+                                               min_posterior,
                                                determinize_delta,
                                                acoustic_scale,
                                                graph_scale,

@@ -1,0 +1,8 @@
+0005174_page003.0005174_page003-1-emb Z _ { 4 }
+0009120_page002.0009120_page002-22-emb \hat { p } _ { \mu }
+0112086_page003.0112086_page003-12-emb A _ { i } ( {@ u }@ ) @bin\cdot v @rel= 0
+0110059_page002.0110059_page002-21-emb [ {@ p _ { i } @punct, p _ { j } }@ ] @rel= 0
+0205123_page020.0205123_page020-18-emb k _ { i } ( {@ g h }@ ) @rel= k _ { i } ( {@ g }@ ) R ( {@ h }@ )
+0005070_page012.0005070_page012-1-emb ( {@ y { } _ { { } _ { \Gamma _ { a b } } } @punct, \phi { } _ { { } _ { \Gamma _ { a b } } } }@ )
+0211264_page010.0211264_page010-0-iso \delta S @rel\in P _ { F } ^ { 0 } @punct,
+0012145_page056.0012145_page056-4-iso {@ \frac { d i m \hat { E } } { d i m E } }@ @rel= \vert d e t ( {@ A }@ ) \vert ^ { @bin- 1 \slash 2 } \, @punct.
